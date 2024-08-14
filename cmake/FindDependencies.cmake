@@ -30,6 +30,7 @@ find_package(Glew ${COLMAP_FIND_TYPE})
 
 find_package(Git)
 
+set(Ceres_DIR /usr/lib/cmake/Ceres)
 find_package(Ceres ${COLMAP_FIND_TYPE})
 if(NOT TARGET Ceres::ceres)
     # Older Ceres versions don't come with an imported interface target.

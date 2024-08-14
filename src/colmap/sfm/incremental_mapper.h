@@ -167,10 +167,25 @@ class IncrementalMapper {
   // ignores images that failed to registered for `max_reg_trials`.
   std::vector<image_t> FindNextImages(const Options& options);
 
+  // Attempt to seed the reconstruction from an image pair with slam pose.
+  bool RegisterInitialImagePairSLAM(const Options& options,
+                                                 const image_t image_id1,
+                                                 const image_t image_id2,
+                                                 Rigid3d& pose1,
+                                                 Rigid3d& pose2);
+
+  // Attempt to seed the reconstruction from an paranoma with the split fov pose.
+  bool RegisterInitialImagePara(const Options& options,
+                                      const image_t image_id1,
+                                      Rigid3d& pose1);
+
   // Attempt to seed the reconstruction from an image pair.
   bool RegisterInitialImagePair(const Options& options,
                                 image_t image_id1,
                                 image_t image_id2);
+
+  // Attpept to register image with known poses
+  bool RegisterImageSLAM(const Options& options, image_t image_id, std::shared_ptr<Reconstruction>);
 
   // Attempt to register image to the existing model. This requires that
   // a previous call to `RegisterInitialImagePair` was successful.
@@ -232,6 +247,9 @@ class IncrementalMapper {
 
   // Clear the collection of changed 3D points.
   void ClearModifiedPoints3D();
+
+  // // Copy slam pose to new reconstruction
+  // void copyPose(Image& cur_prior, Image& prev, Image& prev_rec, Image& image);
 
  private:
   // Find seed images for incremental reconstruction. Suitable seed images have

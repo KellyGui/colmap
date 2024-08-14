@@ -32,6 +32,7 @@
 #include "colmap/controllers/incremental_mapper.h"
 
 #include "colmap/util/misc.h"
+#include<algorithm>
 
 namespace colmap {
 namespace {
@@ -56,9 +57,9 @@ void AdjustGlobalBundle(const IncrementalMapperOptions& options,
   // Use stricter convergence criteria for first registered images.
   const size_t kMinNumRegImagesForFastBA = 10;
   if (num_reg_images < kMinNumRegImagesForFastBA) {
-    custom_ba_options.solver_options.function_tolerance /= 10;
-    custom_ba_options.solver_options.gradient_tolerance /= 10;
-    custom_ba_options.solver_options.parameter_tolerance /= 10;
+    custom_ba_options.solver_options.function_tolerance *= 10;
+    custom_ba_options.solver_options.gradient_tolerance *= 10;
+    custom_ba_options.solver_options.parameter_tolerance *= 10;
     custom_ba_options.solver_options.max_num_iterations *= 2;
     custom_ba_options.solver_options.max_linear_solver_iterations = 200;
   }
@@ -116,7 +117,8 @@ void IterativeGlobalRefinement(const IncrementalMapperOptions& options,
     size_t num_changed_observations = 0;
     AdjustGlobalBundle(options, mapper);
     num_changed_observations += CompleteAndMergeTracks(options, mapper);
-    num_changed_observations += FilterPoints(options, mapper);
+    if(mapper->GetReconstruction().NumRegImages()>27)
+      num_changed_observations += FilterPoints(options, mapper);
     const double changed =
         num_observations == 0
             ? 0
@@ -390,11 +392,11 @@ void IncrementalMapperController::Reconstruct(
     }
 
     size_t reconstruction_idx;
-    if (!initial_reconstruction_given || num_trials > 0) {
+    // if (!initial_reconstruction_given || num_trials > 0) {
       reconstruction_idx = reconstruction_manager_->Add();
-    } else {
-      reconstruction_idx = 0;
-    }
+    // } else {
+    //   reconstruction_idx = 0;
+    // }
 
     std::shared_ptr<Reconstruction> reconstruction =
         reconstruction_manager_->Get(reconstruction_idx);
@@ -404,55 +406,82 @@ void IncrementalMapperController::Reconstruct(
     ////////////////////////////////////////////////////////////////////////////
     // Register initial pair
     ////////////////////////////////////////////////////////////////////////////
+    
+    // For instruction using slam poses, there are a coarse model as input
+    const auto& slam_reconstruction = reconstruction_manager_->Get(0);
+    image_t image_id1 = static_cast<image_t>(options_->init_image_id1);
+    image_t image_id2 = static_cast<image_t>(options_->init_image_id2);
 
+    reconstruction->Camera(1) = slam_reconstruction->Camera(1);
     if (reconstruction->NumRegImages() == 0) {
-      image_t image_id1 = static_cast<image_t>(options_->init_image_id1);
-      image_t image_id2 = static_cast<image_t>(options_->init_image_id2);
+      // with slam pose, we have the specified initial pair, must be provided from input
+      //copy poses to current reconstruction
+      // reconstruction_->RegisterImage(image_id1);
+      // reconstruction_->RegisterImage(image_id2);
+      Image& image1_slam = slam_reconstruction->Image(image_id1);
+      Image& image2_slam = slam_reconstruction->Image(image_id2);
 
-      // Try to find good initial pair.
-      if (options_->init_image_id1 == -1 || options_->init_image_id2 == -1) {
-        PrintHeading1("Finding good initial image pair");
-        const bool find_init_success = mapper.FindInitialImagePair(
-            init_mapper_options, &image_id1, &image_id2);
-        if (!find_init_success) {
-          std::cout << "  => No good initial image pair found." << std::endl;
-          mapper.EndReconstruction(/*discard=*/true);
-          reconstruction_manager_->Delete(reconstruction_idx);
-          break;
+      mapper.RegisterInitialImagePairSLAM(init_mapper_options, image_id1, image_id2,
+                                          image1_slam.CamFromWorld(),image2_slam.CamFromWorld());
+
+      // Triangulate other images from same paranoma
+      for(int i=image_id1+1;i<image_id1+9;++i) {  
+        Image& image_slam = slam_reconstruction->Image(i);
+        mapper.RegisterInitialImagePara(init_mapper_options,i,image_slam.CamFromWorld());
+        Image& image_i = reconstruction->Image(i);
+        // if(image_i.NumPoints3D()==0){
+          size_t new_points3D_num = TriangulateImage(*options_, image_i, &mapper);
+          if(new_points3D_num==0){
+            reconstruction->DeRegisterImage(i);
         }
-      } else {
-        if (!reconstruction->ExistsImage(image_id1) ||
-            !reconstruction->ExistsImage(image_id2)) {
-          std::cout << StringPrintf(
-                           "  => Initial image pair #%d and #%d do not exist.",
-                           image_id1,
-                           image_id2)
-                    << std::endl;
-          mapper.EndReconstruction(/*discard=*/true);
-          reconstruction_manager_->Delete(reconstruction_idx);
-          return;
-        }
+          
       }
+      
+      // // Try to find good initial pair.
+      // if (options_->init_image_id1 == -1 || options_->init_image_id2 == -1) {
+      //   PrintHeading1("Finding good initial image pair");
+      //   const bool find_init_success = mapper.FindInitialImagePair(
+      //       init_mapper_options, &image_id1, &image_id2);
+      //   if (!find_init_success) {
+      //     std::cout << "  => No good initial image pair found." << std::endl;
+      //     mapper.EndReconstruction(/*discard=*/true);
+      //     reconstruction_manager_->Delete(reconstruction_idx);
+      //     break;
+      //   }
+      // } else {
+      //   if (!reconstruction->ExistsImage(image_id1) ||
+      //       !reconstruction->ExistsImage(image_id2)) {
+      //     std::cout << StringPrintf(
+      //                      "  => Initial image pair #%d and #%d do not exist.",
+      //                      image_id1,
+      //                      image_id2)
+      //               << std::endl;
+      //     mapper.EndReconstruction(/*discard=*/true);
+      //     reconstruction_manager_->Delete(reconstruction_idx);
+      //     return;
+      //   }
+      // }
 
-      PrintHeading1(StringPrintf(
-          "Initializing with image pair #%d and #%d", image_id1, image_id2));
-      const bool reg_init_success = mapper.RegisterInitialImagePair(
-          init_mapper_options, image_id1, image_id2);
-      if (!reg_init_success) {
-        std::cout << "  => Initialization failed - possible solutions:"
-                  << std::endl
-                  << "     - try to relax the initialization constraints"
-                  << std::endl
-                  << "     - manually select an initial image pair"
-                  << std::endl;
-        mapper.EndReconstruction(/*discard=*/true);
-        reconstruction_manager_->Delete(reconstruction_idx);
-        break;
-      }
-
+      // PrintHeading1(StringPrintf(
+      //     "Initializing with image pair #%d and #%d", image_id1, image_id2));
+      // const bool reg_init_success = mapper.RegisterInitialImagePair(
+      //     init_mapper_options, image_id1, image_id2);
+      // if (!reg_init_success) {
+      //   std::cout << "  => Initialization failed - possible solutions:"
+      //             << std::endl
+      //             << "     - try to relax the initialization constraints"
+      //             << std::endl
+      //             << "     - manually select an initial image pair"
+      //             << std::endl;
+      //   mapper.EndReconstruction(/*discard=*/true);
+      //   reconstruction_manager_->Delete(reconstruction_idx);
+      //   break;
+      // }
+      
+       WriteSnapshot(*reconstruction, options_->snapshot_path);
       AdjustGlobalBundle(*options_, &mapper);
-      FilterPoints(*options_, &mapper);
-      FilterImages(*options_, &mapper);
+      // FilterPoints(*options_, &mapper);
+      // FilterImages(*options_, &mapper);
 
       // Initial image pair failed to register.
       if (reconstruction->NumRegImages() == 0 ||
@@ -492,76 +521,122 @@ void IncrementalMapperController::Reconstruct(
       }
 
       reg_next_success = false;
+      image_t last_s=1,last_e=9;
+      // // image_t total_image = static_cast<image_t>(slam_reconstruction->RegImageIds());
+      //For construction using slam poses, the sequence of next image is settled
+      for(image_t next_image_id :slam_reconstruction->RegImageIds() ){
+     
+        
+        if(next_image_id>=last_s && next_image_id<=last_e)
+          continue;
 
-      const std::vector<image_t> next_images =
-          mapper.FindNextImages(options_->Mapper());
+        
+         std::vector<image_t> next_images =
+            mapper.FindNextImages(options_->Mapper());
 
-      if (next_images.empty()) {
-        break;
-      }
-
-      for (size_t reg_trial = 0; reg_trial < next_images.size(); ++reg_trial) {
-        const image_t next_image_id = next_images[reg_trial];
-        const Image& next_image = reconstruction->Image(next_image_id);
-
-        PrintHeading1(StringPrintf("Registering image #%d (%d)",
-                                   next_image_id,
-                                   reconstruction->NumRegImages() + 1));
-
-        std::cout << StringPrintf("  => Image sees %d / %d points",
-                                  next_image.NumVisiblePoints3D(),
-                                  next_image.NumObservations())
-                  << std::endl;
-
-        reg_next_success =
-            mapper.RegisterNextImage(options_->Mapper(), next_image_id);
-
-        if (reg_next_success) {
-          TriangulateImage(*options_, next_image, &mapper);
-          IterativeLocalRefinement(*options_, next_image_id, &mapper);
-
-          if (reconstruction->NumRegImages() >=
-                  options_->ba_global_images_ratio * ba_prev_num_reg_images ||
-              reconstruction->NumRegImages() >=
-                  options_->ba_global_images_freq + ba_prev_num_reg_images ||
-              reconstruction->NumPoints3D() >=
-                  options_->ba_global_points_ratio * ba_prev_num_points ||
-              reconstruction->NumPoints3D() >=
-                  options_->ba_global_points_freq + ba_prev_num_points) {
-            IterativeGlobalRefinement(*options_, &mapper);
-            ba_prev_num_points = reconstruction->NumPoints3D();
-            ba_prev_num_reg_images = reconstruction->NumRegImages();
-          }
-
-          if (options_->extract_colors) {
-            ExtractColors(image_path_, next_image_id, reconstruction.get());
-          }
-
-          if (options_->snapshot_images_freq > 0 &&
-              reconstruction->NumRegImages() >=
-                  options_->snapshot_images_freq +
-                      snapshot_prev_num_reg_images) {
-            snapshot_prev_num_reg_images = reconstruction->NumRegImages();
-            WriteSnapshot(*reconstruction, options_->snapshot_path);
-          }
-
-          Callback(NEXT_IMAGE_REG_CALLBACK);
-
+        if (next_images.empty()) {
           break;
-        } else {
-          std::cout << "  => Could not register, trying another image."
-                    << std::endl;
+        }
 
-          // If initial pair fails to continue for some time,
-          // abort and try different initial pair.
-          const size_t kMinNumInitialRegTrials = 30;
-          if (reg_trial >= kMinNumInitialRegTrials &&
-              reconstruction->NumRegImages() <
-                  static_cast<size_t>(options_->min_model_size)) {
-            break;
+        // for (size_t reg_trial = 0; reg_trial < next_images.size(); ++reg_trial) {
+        //   const image_t next_image_id = next_images[reg_trial];
+
+          // if(!reconstruction->ExistsImage(next_image_id))
+          //   continue;
+          // if(reconstruction->IsImageRegistered(next_image_id)) 
+          //   continue;
+        //find the set from an paranoma
+        
+        auto n = (next_image_id-1)/9;
+        last_s = 1+n*9;
+        last_e = 9+n*9;
+        for(auto j = 1;j<=9;++j) {
+          auto next_reg_image_id = j+n*9;
+          if(std::find(next_images.begin(), next_images.end(), next_reg_image_id)!= next_images.end())
+            continue;
+          else
+            next_images.emplace_back(next_reg_image_id);
+        }
+        for(auto& next_reg_image_id: next_images){
+          if(!reconstruction->ExistsImage(next_reg_image_id))
+            continue;
+          if(reconstruction->IsImageRegistered(next_reg_image_id)) 
+            continue;
+          // std::sort(next_images.begin(),next_images.end());
+          const Image& next_image = reconstruction->Image(next_reg_image_id);
+
+          // if(options_->image_names.empty()) continue;
+          // else {
+          //   if(options_->image_names.count(next_image.Name()) == 0)
+          //     continue;
+          // }
+
+          PrintHeading1(StringPrintf("Registering image #%d (%d)",
+                                    next_reg_image_id,
+                                    reconstruction->NumRegImages() + 1));
+
+          std::cout << StringPrintf("  => Image sees %d / %d points",
+                                    next_image.NumVisiblePoints3D(),
+                                    next_image.NumObservations())
+                    << std::endl;
+          //use relative poses, so skip the pnp calculation
+          reg_next_success = mapper.RegisterImageSLAM(options_->Mapper(), next_reg_image_id, slam_reconstruction);
+          if(reg_next_success==false){
+            auto num_frm_tri = TriangulateImage(*options_, next_image, &mapper);
+            if(num_frm_tri > 0) 
+              reg_next_success=true;
+          }
+          //   reg_next_success =
+          //       mapper.RegisterNextImage(options_->Mapper(), next_image_id);
+
+          if (reg_next_success) {
+            TriangulateImage(*options_, next_image, &mapper);
+            IterativeLocalRefinement(*options_, next_reg_image_id, 
+            &mapper);
+
+            if (reconstruction->NumRegImages() >=
+                    options_->ba_global_images_ratio * ba_prev_num_reg_images ||
+                reconstruction->NumRegImages() >=
+                    options_->ba_global_images_freq + ba_prev_num_reg_images ||
+                reconstruction->NumPoints3D() >=
+                    options_->ba_global_points_ratio * ba_prev_num_points ||
+                reconstruction->NumPoints3D() >=
+                    options_->ba_global_points_freq + ba_prev_num_points) {
+              IterativeGlobalRefinement(*options_, &mapper);
+              ba_prev_num_points = reconstruction->NumPoints3D();
+              ba_prev_num_reg_images = reconstruction->NumRegImages();
+            }
+
+            if (options_->extract_colors) {
+              ExtractColors(image_path_, next_reg_image_id, reconstruction.get());
+            }
+
+            if (options_->snapshot_images_freq > 0 &&
+                reconstruction->NumRegImages() >=
+                    options_->snapshot_images_freq +
+                        snapshot_prev_num_reg_images) {
+              snapshot_prev_num_reg_images = reconstruction->NumRegImages();
+              WriteSnapshot(*reconstruction, options_->snapshot_path);
+            }
+
+            Callback(NEXT_IMAGE_REG_CALLBACK);
+
+            // break;
+          } else {
+            std::cout << "  => Could not register, trying another image."
+                      << std::endl;
+
+            // If initial pair fails to continue for some time,
+            // abort and try different initial pair.
+            // const size_t kMinNumInitialRegTrials = 30;
+            // if ( reg_trial>= kMinNumInitialRegTrials &&
+            //     reconstruction->NumRegImages() <
+            //         static_cast<size_t>(options_->min_model_size)) {
+            //   break;
+            // }
           }
         }
-      }
+      
 
       const size_t max_model_overlap =
           static_cast<size_t>(options_->max_model_overlap);
@@ -579,6 +654,7 @@ void IncrementalMapperController::Reconstruct(
       } else {
         prev_reg_next_success = reg_next_success;
       }
+    }
     }
 
     if (IsStopped()) {
@@ -619,8 +695,9 @@ void IncrementalMapperController::Reconstruct(
             static_cast<size_t>(options_->max_num_models) ||
         total_num_reg_images >= database_cache_->NumImages() - 1) {
       break;
-    }
-  }
+    }     
+  } 
 }
+
 
 }  // namespace colmap

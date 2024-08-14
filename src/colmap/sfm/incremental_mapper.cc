@@ -259,6 +259,219 @@ std::vector<image_t> IncrementalMapper::FindNextImages(const Options& options) {
   return ranked_images_ids;
 }
 
+bool IncrementalMapper::RegisterInitialImagePairSLAM(const Options& options,
+                                                 const image_t image_id1,
+                                                 const image_t image_id2,
+                                                 Rigid3d& pose1,
+                                                 Rigid3d& pose2) {
+  CHECK_NOTNULL(reconstruction_);
+  CHECK_EQ(reconstruction_->NumRegImages(), 0);
+
+  CHECK(options.Check());
+
+  init_num_reg_trials_[image_id1] += 1;
+  init_num_reg_trials_[image_id2] += 1;
+  num_reg_trials_[image_id1] += 1;
+  num_reg_trials_[image_id2] += 1;
+  Image& image1 = reconstruction_->Image(image_id1);
+  Image& image2 = reconstruction_->Image(image_id2);
+  image1.CamFromWorld() = pose1;
+  image2.CamFromWorld() = pose2;
+  reconstruction_->RegisterImage(image_id1);
+  reconstruction_->RegisterImage(image_id2);
+
+  const Camera& camera1 = reconstruction_->Camera(image1.CameraId());
+  const Camera& camera2 = reconstruction_->Camera(image2.CameraId());
+
+  const Eigen::Matrix3x4d cam_from_world1 = image1.CamFromWorld().ToMatrix();
+  const Eigen::Matrix3x4d cam_from_world2 = image2.CamFromWorld().ToMatrix();
+  const Eigen::Vector3d proj_center1 = image1.ProjectionCenter();
+  const Eigen::Vector3d proj_center2 = image2.ProjectionCenter();
+
+  const FeatureMatches& corrs =
+      database_cache_->CorrespondenceGraph()->FindCorrespondencesBetweenImages(
+          image_id1, image_id2);
+
+  const double min_tri_angle_rad = DegToRad(options.init_min_tri_angle);
+  Eigen::Matrix3d cam_K;
+      cam_K << camera2.FocalLengthX(),0,camera2.PrincipalPointX(),
+                0, camera2.FocalLengthY(),camera2.PrincipalPointY(),
+                0,0,1;
+
+  // Add 3D point tracks.
+  Track track;
+  track.Reserve(2);
+  track.AddElement(TrackElement());
+  track.AddElement(TrackElement());
+  track.Element(0).image_id = image_id1;
+  track.Element(1).image_id = image_id2;
+  for (const auto& corr : corrs) {
+    const Eigen::Vector2d point2D1 =
+        camera1.CamFromImg(image1.Point2D(corr.point2D_idx1).xy);
+    const Eigen::Vector2d point2D2 =
+        camera2.CamFromImg(image2.Point2D(corr.point2D_idx2).xy);
+    const Eigen::Vector3d& xyz =
+        TriangulatePoint(cam_from_world1, cam_from_world2, point2D1, point2D2);
+    const double tri_angle =
+        CalculateTriangulationAngle(proj_center1, proj_center2, xyz);
+    // if (tri_angle >= min_tri_angle_rad &&
+    //     HasPointPositiveDepth(cam_from_world1, xyz) &&
+    //     HasPointPositiveDepth(cam_from_world2, xyz)) {
+    //   track.Element(0).point2D_idx = corr.point2D_idx1;
+    //   track.Element(1).point2D_idx = corr.point2D_idx2;
+    //   reconstruction_->AddPoint3D(xyz, track);
+    // }
+
+
+    //reprojection
+    Eigen::Vector4d point1_c1 = Eigen::Vector4d(point2D1(0),point2D1(1),1,1);
+    Eigen::Matrix4d T_c1_w= Eigen::Matrix4d::Identity();
+    T_c1_w.block<3,4>(0,0) = cam_from_world1;
+    Eigen::Vector4d point_w = T_c1_w.inverse()*point1_c1;
+    
+    // Eigen::Vector4d point_w_4d = point_w.homogeneous();
+    
+    Eigen::Matrix4d T_c2_w= Eigen::Matrix4d::Identity();
+    T_c2_w.block<3,4>(0,0) = cam_from_world2;
+    Eigen::Vector4d point1_c2 = T_c2_w*point_w;
+    Eigen::Vector4d point1_c2_norm = point1_c2.normalized();
+    Eigen::Vector3d point1_c2_3d = Eigen::Vector3d(point1_c2_norm(0),point1_c2_norm(1),point1_c2_norm(2));
+    Eigen::Vector3d point1_c2_3d_norm = point1_c2_3d.normalized();
+    Eigen::Vector2d point1_c2_2d = Eigen::Vector2d(point1_c2_3d_norm(0),point1_c2_3d_norm(1));
+    Eigen::Vector2d point1_rep = camera2.ImgFromCam(point1_c2_2d);
+    //check if it is in picture
+    if(point1_rep(0)<0||point1_rep(0)>1960||point1_rep(1)<0||point1_rep(1)>960)
+      continue;
+    const Eigen::Vector2d point2D2_uv =image2.Point2D(corr.point2D_idx2).xy;
+    double diff = std::pow(point1_rep(0)-point2D2_uv(0),2)+std::pow(point1_rep(1)-point2D2_uv(1),2);
+    if ( diff < 100 && tri_angle >= min_tri_angle_rad &&
+            HasPointPositiveDepth(cam_from_world1, xyz) &&
+                HasPointPositiveDepth(cam_from_world2, xyz)) {
+              track.Element(0).point2D_idx = corr.point2D_idx1;
+              track.Element(1).point2D_idx = corr.point2D_idx2;
+              reconstruction_->AddPoint3D(xyz, track);
+          }
+  }
+
+  
+
+  return true;
+}
+
+bool IncrementalMapper::RegisterInitialImagePara(const Options& options,
+                                      const image_t i,
+                                      Rigid3d& pose) {
+  Image& image_i = reconstruction_->Image(i);
+  image_i.CamFromWorld() = pose;
+  reconstruction_->RegisterImage(i);
+  //projection and reprojection
+  auto reg_image_ids = reconstruction_->RegImageIds();
+  for( auto& reg_image_id : reg_image_ids) {
+
+      Image& reg_image = reconstruction_->Image(reg_image_id);
+      const FeatureMatches& corrs = database_cache_->CorrespondenceGraph()
+              ->FindCorrespondencesBetweenImages(i, reg_image_id);
+      if(corrs.size()==0)
+        continue;
+      const Camera& camera = reconstruction_->Camera(image_i.CameraId());
+      const Eigen::Matrix3x4d cam_from_world1 = image_i.CamFromWorld().ToMatrix();
+      Eigen::Matrix3d cam_K;
+      cam_K << camera.FocalLengthX(),0,camera.PrincipalPointX(),
+                0, camera.FocalLengthY(),camera.PrincipalPointY(),
+                0,0,1;
+      const Camera& camera2 = reconstruction_->Camera(reg_image.CameraId());
+      const Eigen::Matrix3x4d cam_from_world2 = reg_image.CamFromWorld().ToMatrix();
+      const Eigen::Vector3d proj_center1 = image_i.ProjectionCenter();
+      const Eigen::Vector3d proj_center2 = reg_image.ProjectionCenter();
+
+      const double min_tri_angle_rad = DegToRad(options.init_min_tri_angle);
+ 
+      // Add 3D point tracks.
+      Track track;
+      track.Reserve(2);
+      track.AddElement(TrackElement());
+      track.AddElement(TrackElement());
+      track.Element(0).image_id = i;
+      track.Element(1).image_id = reg_image_id;  
+      for (const auto& corr : corrs) {
+          const Eigen::Vector2d point2D1 =
+            camera.CamFromImg(image_i.Point2D(corr.point2D_idx1).xy);
+         
+          if(reg_image.Point2D(corr.point2D_idx2).HasPoint3D())
+            continue;
+
+          // const Eigen::Vector2d point2D1 =
+          //   camera1.CamFromImg(image1.Point2D(corr.point2D_idx1).xy);
+          const Eigen::Vector2d point2D2 =
+            camera2.CamFromImg(reg_image.Point2D(corr.point2D_idx2).xy);
+          const Eigen::Vector3d& xyz =
+            TriangulatePoint(cam_from_world1, cam_from_world2, point2D1, point2D2);
+          const double tri_angle =
+            CalculateTriangulationAngle(proj_center1, proj_center2, xyz);
+            //reprojection
+          Eigen::Vector4d point1_c1 = Eigen::Vector4d(point2D1(0),point2D1(1),1,1);
+          Eigen::Matrix4d T_c1_w= Eigen::Matrix4d::Identity();
+          T_c1_w.block<3,4>(0,0) = cam_from_world1;
+          Eigen::Vector4d point_w = T_c1_w.inverse()*point1_c1;
+          
+          // Eigen::Vector4d point_w_4d = point_w.homogeneous();
+          
+          Eigen::Matrix4d T_c2_w= Eigen::Matrix4d::Identity();
+          T_c2_w.block<3,4>(0,0) = cam_from_world2;
+          Eigen::Vector4d point1_c2 = T_c2_w*point_w;
+          Eigen::Vector4d point1_c2_norm = point1_c2.normalized();
+          Eigen::Vector3d point1_c2_3d = Eigen::Vector3d(point1_c2_norm(0),point1_c2_norm(1),point1_c2_norm(2));
+          Eigen::Vector3d point1_c2_3d_norm = point1_c2_3d.normalized();
+          Eigen::Vector2d point1_c2_2d = Eigen::Vector2d(point1_c2_3d_norm(0),point1_c2_3d_norm(1));
+          Eigen::Vector2d point1_rep = camera2.ImgFromCam(point1_c2_2d);
+          //check if it is in picture
+          if(point1_rep(0)<0||point1_rep(0)>1960||point1_rep(1)<0||point1_rep(1)>960)
+            continue;
+          const Eigen::Vector2d point2D2_uv =reg_image.Point2D(corr.point2D_idx2).xy;
+          double diff = std::pow(point1_rep(0)-point2D2_uv(0),2)+std::pow(point1_rep(1)-point2D2_uv(1),2);
+          if ( diff < 100 && tri_angle >= min_tri_angle_rad &&
+            HasPointPositiveDepth(cam_from_world1, xyz) &&
+            HasPointPositiveDepth(cam_from_world2, xyz)) {
+            track.Element(0).point2D_idx = corr.point2D_idx1;
+            track.Element(1).point2D_idx = corr.point2D_idx2;
+            reconstruction_->AddPoint3D(xyz, track);
+          }
+      //     const Eigen::Vector2d point2D2_uv =reg_image.Point2D(corr.point2D_idx2).xy;
+      //     const Eigen::Vector2d point2D2 =
+      //         camera2.CamFromImg(reg_image.Point2D(corr.point2D_idx2).xy);
+      //     const Eigen::Vector3d point3D1_cam = Eigen::Vector3d(point2D1(0),point2D1(1),1);
+      //     Eigen::Vector3d xyz_c = cam_K.inverse()*point3D1_cam;
+      //     Eigen::Matrix4d T_c1_w= Eigen::Matrix4d::Identity();
+      //     T_c1_w.block<3,4>(0,0) = cam_from_world1;
+      //     const Eigen::Vector4d xyz4D_c = Eigen::Vector4d(xyz_c(0),xyz_c(1),xyz_c(2),1);
+      //     const Eigen::Vector4d xyz4D_w = T_c1_w.inverse()*xyz4D_c.normalized();
+      //     const Eigen::Vector3d xyz_w = Eigen::Vector3d(xyz4D_w(0)/xyz4D_w(3), xyz4D_w(1)/xyz4D_w(3), xyz4D_w(2)/xyz4D_w(3));
+
+      //     //reprojection
+      //     Eigen::Matrix4d T_c2_w= Eigen::Matrix4d::Identity();
+      //     T_c2_w.block<3,4>(0,0) = cam_from_world2;
+      //     const Eigen::Vector4d xyz4D_c2 = T_c2_w * xyz4D_w.normalized();
+      //     const Eigen::Vector4d xyz4D_c2_norm = xyz4D_c2.normalized();
+      //     const Eigen::Vector3d xyz_c2 = Eigen::Vector3d(xyz4D_c2_norm(0), xyz4D_c2(1),xyz4D_c2(2));
+      //     const Eigen::Vector3d point3D2_rep = cam_K*xyz_c2;
+      //     const Eigen::Vector2d point2D2_rep = Eigen::Vector2d(point3D2_rep(0)/point3D2_rep(2),point3D2_rep(1)/point3D2_rep(2));
+      //     double diff = std::pow(point2D2_rep(0)-point2D2_uv(0),2)+std::pow(point2D2_rep(1)-point2D2_uv(1),2);
+      //     if ( diff < 3 &&
+      //       HasPointPositiveDepth(cam_from_world1, xyz_w) &&
+      //           HasPointPositiveDepth(cam_from_world2, xyz_w)) {
+      //         track.Element(0).point2D_idx = corr.point2D_idx1;
+      //         track.Element(1).point2D_idx = corr.point2D_idx2;
+      //         reconstruction_->AddPoint3D(xyz_w, track);
+      //     }
+            
+      }
+
+  }
+  
+  return true;
+
+}
+
 bool IncrementalMapper::RegisterInitialImagePair(const Options& options,
                                                  const image_t image_id1,
                                                  const image_t image_id2) {
@@ -339,6 +552,242 @@ bool IncrementalMapper::RegisterInitialImagePair(const Options& options,
   }
 
   return true;
+}
+
+// void IncrementalMapper::copyPose(Image& cur_prior, Image& prev, Image& prev_rec, Image& image) {
+
+//     Eigen::Matrix3x4d T_prev_world_ = prev.CamFromWorld.ToMatrix();
+//     Eigen::Matrix4d T_prev_world = Eigen::Matrix4d::Identity();
+//     T_prev_world.block<3,4>(0,0) =  T_prev_world_;
+//     Eigen::Matrix3x4d T_cur_world_ = cur_prior.CamFromWorld.ToMatrix();
+//     Eigen::Matrix4d T_cur_world = Eigen::Matrix4d::Identity();
+//     T_cur_world.block<3,4>(0,0) =  T_cur_world_;
+//     Eigen::Matrix3x4d T_prevrec_world_ = prev_rec.CamFromWorld.ToMatrix();
+//     Eigen::Matrix4d T_prevrec_world = Eigen::Matrix4d::Identity();
+//     T_prevprior_world.block<3,4>(0,0) =  T_prevprior_world_;
+
+//     Eigen::Matrix4d T_cur_world = T_cur_world_*T_prevprior_world_.inverse()*T_prevrec_world;
+//     Eigen::Matrix3d R_cur_world = T_cur_world.block(0,0,3,3);
+//     Eigen::Quaterniond q_cur_world(R_cur_world);
+//     Eigen::Vector3d t_cur_world;
+//     t_cur_world<<T_cur_world(0,3),T_cur_world(1,3),T_cur_world(2,3);
+
+//     image.CamFromWorld.rotation = q_cur_world;
+//     image.CamFromWorld.translation = t_cur_world;  
+// }
+
+bool IncrementalMapper::RegisterImageSLAM(const Options& options,
+                                          const image_t image_id, std::shared_ptr<Reconstruction> reconstruction_slam) {
+  CHECK_NOTNULL(reconstruction_slam);
+  CHECK(options.Check());
+
+  Image& image = reconstruction_->Image(image_id);
+  Image& image_prior = reconstruction_slam->Image(image_id);
+  Camera& camera = reconstruction_slam->Camera(image.CameraId());
+
+  Eigen::Matrix3d cam_K;
+  cam_K << camera.FocalLengthX(),0,camera.PrincipalPointX(),
+           0, camera.FocalLengthY(),camera.PrincipalPointY(),
+           0,0,1;
+
+  CHECK(!image.IsRegistered()) << "Image cannot be registered multiple times";
+
+  num_reg_trials_[image_id] += 1;
+
+  //compute relative pose
+    image_t prev_image_id =image_id-1;
+    // int num = 18;
+    while(!reconstruction_->ExistsCamera(prev_image_id) ) {
+      --prev_image_id;
+      // --num;
+      // if(prev_image_id<1 || num<0) return false;
+      if(prev_image_id<1) return false;
+    }
+      
+    Image& prev_image = reconstruction_slam->Image(prev_image_id);
+    Image& prev_image_rec = reconstruction_->Image(prev_image_id);
+
+    Eigen::Matrix3x4d T_prev_world_ = prev_image.CamFromWorld().ToMatrix();
+    Eigen::Matrix4d T_prev_world = Eigen::Matrix4d::Identity();
+    T_prev_world.block<3,4>(0,0) =  T_prev_world_;
+    Eigen::Matrix3x4d T_curprior_world_ = image_prior.CamFromWorld().ToMatrix();
+    Eigen::Matrix4d T_curprior_world = Eigen::Matrix4d::Identity();
+    T_curprior_world.block<3,4>(0,0) =  T_curprior_world_;
+    Eigen::Matrix3x4d T_prevrec_world_ = prev_image_rec.CamFromWorld().ToMatrix();
+    Eigen::Matrix4d T_prevrec_world = Eigen::Matrix4d::Identity();
+    T_prevrec_world.block<3,4>(0,0) =  T_prevrec_world_;
+
+    Eigen::Matrix4d T_cur_world = T_curprior_world*T_prev_world.inverse()*T_prevrec_world;
+    Eigen::Matrix3d R_cur_world = T_cur_world.block(0,0,3,3);
+    Eigen::Quaterniond q_cur_world(R_cur_world);
+    Eigen::Vector3d t_cur_world;
+    t_cur_world<<T_cur_world(0,3),T_cur_world(1,3),T_cur_world(2,3);
+
+    image.CamFromWorld().rotation = q_cur_world;
+    image.CamFromWorld().translation = t_cur_world;
+  
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Search for 2D-3D correspondences
+  //////////////////////////////////////////////////////////////////////////////
+
+  std::vector<std::pair<point2D_t, point3D_t>> tri_corrs;
+  std::vector<Eigen::Vector2d> tri_points2D;
+  std::vector<Eigen::Vector3d> tri_points3D;
+
+  const std::shared_ptr<const CorrespondenceGraph> correspondence_graph =
+      database_cache_->CorrespondenceGraph();
+
+  std::unordered_set<point3D_t> corr_point3D_ids;
+  for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
+       ++point2D_idx) {
+    const Point2D& point2D = image.Point2D(point2D_idx);
+
+    corr_point3D_ids.clear();
+    const auto corr_range =
+        correspondence_graph->FindCorrespondences(image_id, point2D_idx);
+    for (const auto* corr = corr_range.beg; corr < corr_range.end; ++corr) {
+      const Image& corr_image = reconstruction_->Image(corr->image_id);
+      if (!corr_image.IsRegistered()) {
+        continue;
+      }
+
+      const Point2D& corr_point2D = corr_image.Point2D(corr->point2D_idx);
+      if (!corr_point2D.HasPoint3D()) {
+        continue;
+      }
+
+      // Avoid duplicate correspondences.
+      if (corr_point3D_ids.count(corr_point2D.point3D_id) > 0) {
+        continue;
+      }
+
+      const Camera& corr_camera =
+          reconstruction_->Camera(corr_image.CameraId());
+
+      // Avoid correspondences to images with bogus camera parameters.
+      if (corr_camera.HasBogusParams(options.min_focal_length_ratio,
+                                     options.max_focal_length_ratio,
+                                     options.max_extra_param)) {
+        continue;
+      }
+
+      const Point3D& point3D =
+          reconstruction_->Point3D(corr_point2D.point3D_id);
+
+      tri_corrs.emplace_back(point2D_idx, corr_point2D.point3D_id);
+      corr_point3D_ids.insert(corr_point2D.point3D_id);
+      tri_points2D.push_back(point2D.xy);
+      tri_points3D.push_back(point3D.XYZ());
+    }
+  }
+
+  if(tri_points3D.size()==0){
+    // reconstruction_->RegisterImage(image_id);
+    // RegisterImageEvent(image_id);
+    return false;
+  }
+
+  //find inliers
+  size_t num_inliers=0;
+  std::vector<char> inlier_mask(tri_points3D.size());
+
+  Eigen::Matrix3x4d cam_from_world = image.CamFromWorld().ToMatrix();
+  double max_residual = options.abs_pose_max_error * options.abs_pose_max_error;
+  for(size_t i=0;i<tri_points3D.size();++i) {
+        const Eigen::Vector3d point3D_in_cam =
+        cam_from_world * tri_points3D[i].homogeneous();
+        const Eigen::Vector2d points2D_in_cam = camera.CamFromImg(tri_points2D[i]);
+        double residual=0.0;
+        // Check if 3D point is in front of camera.
+        if (point3D_in_cam.z() > std::numeric_limits<double>::epsilon()) {
+          residual=
+              (point3D_in_cam.hnormalized() - points2D_in_cam).squaredNorm();
+        } else {
+          residual = std::numeric_limits<double>::max();
+        }
+        if(residual <= max_residual) num_inliers++;
+        inlier_mask[i] = residual <= max_residual ? 1: 0;     
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Pose refinement
+  //////////////////////////////////////////////////////////////////////////////
+  // Only refine / estimate focal length, if no focal length was specified
+  // (manually or through EXIF) and if it was not already estimated previously
+  // from another image (when multiple images share the same camera
+  // parameters)
+
+  AbsolutePoseEstimationOptions abs_pose_options;
+  abs_pose_options.num_threads = options.num_threads;
+  abs_pose_options.num_focal_length_samples = 30;
+  abs_pose_options.min_focal_length_ratio = options.min_focal_length_ratio;
+  abs_pose_options.max_focal_length_ratio = options.max_focal_length_ratio;
+  abs_pose_options.ransac_options.max_error = options.abs_pose_max_error;
+  abs_pose_options.ransac_options.min_inlier_ratio =
+      options.abs_pose_min_inlier_ratio;
+  // Use high confidence to avoid preemptive termination of P3P RANSAC
+  // - too early termination may lead to bad registration.
+  abs_pose_options.ransac_options.min_num_trials = 100;
+  abs_pose_options.ransac_options.max_num_trials = 10000;
+  abs_pose_options.ransac_options.confidence = 0.99999;
+  AbsolutePoseRefinementOptions abs_pose_refinement_options;
+  if (num_reg_images_per_camera_[image.CameraId()] > 0) {
+    // Camera already refined from another image with the same camera.
+    if (camera.HasBogusParams(options.min_focal_length_ratio,
+                              options.max_focal_length_ratio,
+                              options.max_extra_param)) {
+      // Previously refined camera has bogus parameters,
+      // so reset parameters and try to re-estimage.
+      camera.SetParams(database_cache_->Camera(image.CameraId()).Params());
+      abs_pose_options.estimate_focal_length = !camera.HasPriorFocalLength();
+      abs_pose_refinement_options.refine_focal_length = true;
+      abs_pose_refinement_options.refine_extra_params = true;
+    } else {
+      abs_pose_options.estimate_focal_length = false;
+      abs_pose_refinement_options.refine_focal_length = false;
+      abs_pose_refinement_options.refine_extra_params = false;
+    }
+  } else {
+    // Camera not refined before. Note that the camera parameters might have
+    // been changed before but the image was filtered, so we explicitly reset
+    // the camera parameters and try to re-estimate them.
+    camera.SetParams(database_cache_->Camera(image.CameraId()).Params());
+    abs_pose_options.estimate_focal_length = !camera.HasPriorFocalLength();
+    abs_pose_refinement_options.refine_focal_length = true;
+    abs_pose_refinement_options.refine_extra_params = true;
+  }
+  if (!RefineAbsolutePose(abs_pose_refinement_options,
+                          inlier_mask,
+                          tri_points2D,
+                          tri_points3D,
+                          &image.CamFromWorld(),
+                          &camera)) {
+    return false;
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Continue tracks
+  //////////////////////////////////////////////////////////////////////////////
+
+  reconstruction_->RegisterImage(image_id);
+  RegisterImageEvent(image_id);
+
+  for (size_t i = 0; i < inlier_mask.size(); ++i) {
+    if (inlier_mask[i]) {
+      const point2D_t point2D_idx = tri_corrs[i].first;
+      const Point2D& point2D = image.Point2D(point2D_idx);
+      if (!point2D.HasPoint3D()) {
+        const point3D_t point3D_id = tri_corrs[i].second;
+        const TrackElement track_el(image_id, point2D_idx);
+        reconstruction_->AddObservation(point3D_id, track_el);
+        triangulator_->AddModifiedPoint3D(point3D_id);
+      }
+    }
+  }
+
+  return true;
+
 }
 
 bool IncrementalMapper::RegisterNextImage(const Options& options,
@@ -665,14 +1114,36 @@ IncrementalMapper::AdjustLocalBundle(
   std::unordered_set<image_t> filter_image_ids;
   filter_image_ids.insert(image_id);
   filter_image_ids.insert(local_bundle.begin(), local_bundle.end());
-  report.num_filtered_observations =
+
+  if(reconstruction_->NumRegImages()<9*20){
+    report.num_filtered_observations =
+      reconstruction_->FilterPoints3DInImages(options.filter_max_reproj_error,
+                                              0.05,
+                                              filter_image_ids);
+    report.num_filtered_observations +=
+      reconstruction_->FilterPoints3D(options.filter_max_reproj_error,
+                                      0.05,
+                                      point3D_ids);
+  }
+  else {
+    report.num_filtered_observations =
       reconstruction_->FilterPoints3DInImages(options.filter_max_reproj_error,
                                               options.filter_min_tri_angle,
                                               filter_image_ids);
-  report.num_filtered_observations +=
-      reconstruction_->FilterPoints3D(options.filter_max_reproj_error,
-                                      options.filter_min_tri_angle,
-                                      point3D_ids);
+    report.num_filtered_observations +=
+        reconstruction_->FilterPoints3D(options.filter_max_reproj_error,
+                                        options.filter_min_tri_angle,
+                                        point3D_ids);
+  }
+
+  // report.num_filtered_observations =
+  //     reconstruction_->FilterPoints3DInImages(options.filter_max_reproj_error,
+  //                                             options.filter_min_tri_angle,
+  //                                             filter_image_ids);
+  // report.num_filtered_observations +=
+  //     reconstruction_->FilterPoints3D(options.filter_max_reproj_error,
+  //                                     options.filter_min_tri_angle,
+  //                                     point3D_ids);
 
   return report;
 }

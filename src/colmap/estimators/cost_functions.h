@@ -32,7 +32,7 @@
 #pragma once
 
 #include "colmap/geometry/rigid3.h"
-
+#include <Eigen/Dense> 
 #include <Eigen/Core>
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
@@ -43,6 +43,72 @@ template <typename T>
 using EigenVector3Map = Eigen::Map<const Eigen::Matrix<T, 3, 1>>;
 template <typename T>
 using EigenQuaternionMap = Eigen::Map<const Eigen::Quaternion<T>>;
+
+
+// 函数用于计算两个四元数的点积  
+template <typename T>
+T quaternionDotProduct(const Eigen::Quaternion<T>& q1, const Eigen::Quaternion<T>& q2) {  
+
+    return q1.w() * q2.w() + q1.x() * q2.x() + q1.y() * q2.y() + q1.z() * q2.z();  
+
+} 
+
+// Bundle adjustment cost function for camera poses of images from the
+// same paranoma
+class RelativeAngleCostFunction {
+  public:
+    explicit RelativeAngleCostFunction(image_t& n){
+       offset = n;
+    }
+
+    static ceres::CostFunction* Create(const Rigid3d& cam_from_world1,
+                                     const Rigid3d& cam_from_world2,image_t& n) {
+    return (new ceres::AutoDiffCostFunction<
+            RelativeAngleCostFunction,
+            4,
+            4,
+            3,
+            4,
+            3>(
+        new RelativeAngleCostFunction(n)));
+  }
+
+
+  template <typename T>
+  bool operator()(const T* const cam1_from_world_rotation,
+                  const T* const cam1_from_world_translation,
+                  const T* const cam2_from_world_rotation,
+                  const T* const cam2_from_world_translation,
+                  T* residuals) const {
+    // 旋转轴，这里以绕Y轴为例，但你可以修改为任意单位向量  
+    Eigen::Matrix<T, 3, 1> axis = Eigen::Matrix<T, 3, 1>::UnitY(); // (0, 1, 0)  
+    T angle = T(offset/6*EIGEN_PI ) ; // 度转换为弧度  
+    // 使用AngleAxis创建四元数  
+    Eigen::Quaternion<T> q (Eigen::AngleAxis<T>(angle, axis)); 
+
+    const Eigen::Quaternion<T> cam1_norm =  EigenQuaternionMap<T>(cam1_from_world_rotation).normalized();
+    const Eigen::Quaternion<T> cam2_norm =  EigenQuaternionMap<T>(cam2_from_world_rotation).normalized(); 
+    const Eigen::Quaternion<T> relativeQ_norm = (cam1_norm * q.normalized() ).normalized();
+    const T dot = relativeQ_norm.dot(cam2_norm);  
+    // 确保不会取反余弦值的负数平方根  
+    T dot_positve = std::min(T(1.0), std::max(T(-1.0), dot));  
+
+    // residuals[0] = std::acos(dot_positve);  
+    residuals[0] = ceres::acos(dot_positve);
+    // residuals[1]-= T(relativeQ_norm.x());
+    // residuals[2]-= T(relativeQ_norm.y());
+    // residuals[3]-= T(relativeQ_norm.z());
+
+    Eigen::Matrix<T, 3, 1> translation_diff = EigenVector3Map<T>(cam2_from_world_translation)-EigenVector3Map<T>(cam1_from_world_translation);
+    residuals[1] -= T(translation_diff[0]);
+    residuals[2] -= T(translation_diff[1]);
+    residuals[3] -= T(translation_diff[2]);
+    return true;
+  }
+
+  private:
+    image_t offset;
+};
 
 // Standard bundle adjustment cost function for variable
 // camera pose, calibration, and point parameters.
