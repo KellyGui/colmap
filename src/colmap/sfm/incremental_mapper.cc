@@ -652,6 +652,10 @@ bool IncrementalMapper::RegisterImageSLAM(const Options& options,
         continue;
       }
 
+      //check the correspondence between the corr_image and current registering image
+      point2D_t num_matches = correspondence_graph->NumCorrespondencesBetweenImages(image_id,corr->image_id);
+      if(num_matches<100) continue;
+
       const Point2D& corr_point2D = corr_image.Point2D(corr->point2D_idx);
       if (!corr_point2D.HasPoint3D()) {
         continue;
